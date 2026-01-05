@@ -66,6 +66,7 @@ export default function TaskSidebar({
     isSearchResult,
     getUnreadCount,
     markAllTasksAsViewed,
+    markAllGroupChatsAsViewed,
     viewStatusVersion,
     setSelectedTask,
   } = useTaskContext();
@@ -144,6 +145,11 @@ export default function TaskSidebar({
   // Mark all tasks as viewed
   const handleMarkAllAsViewed = () => {
     markAllTasksAsViewed();
+  };
+
+  // Mark all group chats as viewed
+  const handleMarkAllGroupChatsAsViewed = () => {
+    markAllGroupChatsAsViewed();
   };
 
   // Calculate total unread count
@@ -391,8 +397,17 @@ export default function TaskSidebar({
                 {allGroupChats.length > 0 && (
                   <>
                     {!isCollapsed && (
-                      <div className="px-1 pb-1 text-xs font-medium text-text-muted">
-                        {t('common:tasks.group_chats')}
+                      <div className="px-1 pb-1 text-xs font-medium text-text-muted flex items-center justify-between">
+                        <span>{t('common:tasks.group_chats')}</span>
+                        {/* Mark All Group Chats As Read Button - show only when there are unread group chats */}
+                        {unreadGroupChats.length > 0 && (
+                          <button
+                            onClick={handleMarkAllGroupChatsAsViewed}
+                            className="text-xs text-text-muted hover:text-text-primary transition-colors"
+                          >
+                            {t('common:tasks.mark_all_read')} ({unreadGroupChats.length})
+                          </button>
+                        )}
                       </div>
                     )}
                     <TaskListSection

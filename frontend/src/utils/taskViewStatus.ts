@@ -168,6 +168,28 @@ export function markAllTasksAsViewed(tasks: Task[]): void {
 }
 
 /**
+ * Mark all group chat tasks as viewed
+ * Uses task's updated_at timestamp to avoid client/server time sync issues
+ */
+export function markAllGroupChatsAsViewed(tasks: Task[]): void {
+  const statusMap = getTaskViewStatusMap();
+
+  tasks.forEach(task => {
+    if (task.is_group_chat) {
+      // Use task's updated_at to ensure viewedAt >= taskUpdatedAt
+      const viewedAt = task.updated_at;
+      statusMap[task.id] = {
+        viewedAt,
+        status: task.status,
+      };
+    }
+  });
+
+  const prunedMap = pruneOldViewStatus(statusMap);
+  saveTaskViewStatusMap(prunedMap);
+}
+
+/**
  * Get unread count for a list of tasks
  */
 export function getUnreadCount(tasks: Task[]): number {
