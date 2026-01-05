@@ -210,7 +210,7 @@ export const TaskContextProvider = ({ children }: { children: ReactNode }) => {
         created_at: data.created_at,
         updated_at: data.created_at,
         completed_at: '',
-        is_group_chat: false,
+        is_group_chat: data.is_group_chat || false,
       };
 
       // Initialize view status for the new task
