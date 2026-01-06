@@ -374,6 +374,7 @@
     "group_chats": "Group Chats",
     "group_chats_expand": "Show {{count}}{{suffix}} more",
     "group_chats_collapse": "Show less",
+    "clear_group_chats_unread": "Clear group unread",
     "conversations": "Conversations",
     "search_placeholder": "Search task",
     "search_placeholder_chat": "Search conversation",
