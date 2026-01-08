@@ -599,6 +599,8 @@ class ChatNamespace(socketio.AsyncNamespace):
                         attachment_ids_to_link if attachment_ids_to_link else None
                     ),
                     contexts=payload.contexts,
+                    task=task,
+                    user_name=user_name,
                 )
                 if linked_context_ids:
                     logger.info(
@@ -1355,10 +1357,11 @@ class ChatNamespace(socketio.AsyncNamespace):
         Returns:
             {"success": true} or {"error": "..."}
         """
-        from app.api.ws.events import SkillResponsePayload
-        from app.chat_shell.tools import (
+        from chat_shell.tools import (
             get_pending_request_registry,
         )
+
+        from app.api.ws.events import SkillResponsePayload
 
         request_id = data.get("request_id")
         skill_name = data.get("skill_name")

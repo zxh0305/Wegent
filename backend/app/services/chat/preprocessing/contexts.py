@@ -25,6 +25,49 @@ from app.services.context import context_service
 
 logger = logging.getLogger(__name__)
 
+# Knowledge base prompt constants
+# These are duplicated from chat_shell/prompts/knowledge_base.py for backend use
+# Strict mode prompt: User explicitly selected KB for this message
+KB_PROMPT_STRICT = """
+
+# IMPORTANT: Knowledge Base Requirement
+
+The user has selected specific knowledge bases for this conversation. You MUST use the `knowledge_base_search` tool to retrieve information from these knowledge bases before answering any questions.
+
+## Required Workflow:
+1. **ALWAYS** call `knowledge_base_search` first with the user's query
+2. Wait for the search results
+3. Base your answer **ONLY** on the retrieved information
+4. If the search returns no results or irrelevant information, clearly state: "I cannot find relevant information in the selected knowledge base to answer this question."
+5. **DO NOT** use your general knowledge or make assumptions beyond what's in the knowledge base
+
+## Critical Rules:
+- You MUST search the knowledge base for EVERY user question
+- You MUST NOT answer without searching first
+- You MUST NOT make up information if the knowledge base doesn't contain it
+- If unsure, search again with different keywords
+
+The user expects answers based on the selected knowledge base content only."""
+
+# Relaxed mode prompt: KB inherited from task, AI can use general knowledge as fallback
+KB_PROMPT_RELAXED = """
+
+# Knowledge Base Available
+
+You have access to knowledge bases from previous conversations in this task. You can use the `knowledge_base_search` tool to retrieve information from these knowledge bases.
+
+## Recommended Workflow:
+1. When the user's question might be related to the knowledge base content, consider calling `knowledge_base_search` with relevant keywords
+2. If relevant information is found, prioritize using it in your answer and cite the sources
+3. If the search returns no results or irrelevant information, you may use your general knowledge to answer the question
+4. Be transparent about whether your answer is based on knowledge base content or general knowledge
+
+## Guidelines:
+- Search the knowledge base when the question seems related to its content
+- If the knowledge base doesn't contain relevant information, feel free to answer using your general knowledge
+- Clearly indicate when your answer is based on knowledge base content vs. general knowledge
+- The knowledge base is a helpful resource, but you are not limited to it when it doesn't have relevant information"""
+
 
 async def process_contexts(
     db: Session,
@@ -223,6 +266,8 @@ def link_contexts_to_subtask(
     user_id: int,
     attachment_ids: List[int] | None = None,
     contexts: List[Any] | None = None,
+    task: Optional["TaskResource"] = None,
+    user_name: Optional[str] = None,
 ) -> List[int]:
     """
     Link attachments and create knowledge base contexts for a subtask.
@@ -232,16 +277,24 @@ def link_contexts_to_subtask(
     2. Knowledge bases: Selected at send time, batch create SubtaskContext records
        (without extracted_text - RAG retrieval is done later via tools/Service)
 
+    When knowledge bases are created, they are automatically synced to the task-level
+    knowledgeBaseRefs for future use across all subtasks.
+
     Args:
         db: Database session
         subtask_id: Subtask ID to link contexts to
         user_id: User ID
         attachment_ids: List of pre-uploaded attachment context IDs to link
         contexts: List of ContextItem objects from payload (for knowledge bases)
+        task: Optional pre-queried TaskResource object for syncing KB to task level
+        user_name: Optional pre-queried user name for KB sync boundBy field
 
     Returns:
         List of all linked/created context IDs
     """
+    # Import TaskResource for type hint
+    from app.models.task import TaskResource
+
     linked_context_ids = []
 
     # Collect attachment IDs to link
@@ -259,12 +312,69 @@ def link_contexts_to_subtask(
             db, attachment_ids, kb_contexts_to_create, subtask_id
         )
         linked_context_ids.extend(created_kb_ids)
+
+        # Sync subtask-level knowledge bases to task level
+        if task and kb_contexts_to_create and user_name:
+            _sync_kb_contexts_to_task(
+                db, kb_contexts_to_create, task, user_id, user_name
+            )
+
     except Exception as e:
         db.rollback()
         logger.exception(f"Failed to link contexts to subtask {subtask_id}: {e}")
         raise
 
     return linked_context_ids
+
+
+def _sync_kb_contexts_to_task(
+    db: Session,
+    kb_contexts: List[SubtaskContext],
+    task: "TaskResource",
+    user_id: int,
+    user_name: str,
+) -> None:
+    """
+    Sync subtask-level knowledge base contexts to task-level knowledgeBaseRefs.
+
+    This function syncs each KB selected in the subtask to the task level using
+    append mode with deduplication. Failures are logged but do not raise exceptions.
+
+    Args:
+        db: Database session
+        kb_contexts: List of KB SubtaskContext objects that were just created
+        task: Pre-queried TaskResource object to sync KBs to
+        user_id: User ID who selected the KBs
+        user_name: Pre-queried user name for boundBy field
+    """
+    from app.services.task_knowledge_base_service import task_knowledge_base_service
+
+    for kb_context in kb_contexts:
+        knowledge_id = (
+            kb_context.type_data.get("knowledge_id") if kb_context.type_data else None
+        )
+        if not knowledge_id:
+            continue
+
+        try:
+            synced = task_knowledge_base_service.sync_subtask_kb_to_task(
+                db=db,
+                task=task,
+                knowledge_id=knowledge_id,
+                user_id=user_id,
+                user_name=user_name,
+            )
+            if synced:
+                logger.info(
+                    f"[_sync_kb_contexts_to_task] Synced KB {knowledge_id} "
+                    f"from subtask to task {task.id}"
+                )
+        except Exception as e:
+            # Log but don't fail - syncing to task level is best-effort
+            logger.warning(
+                f"[_sync_kb_contexts_to_task] Failed to sync KB {knowledge_id} "
+                f"to task {task.id}: {e}"
+            )
 
 
 def _prepare_kb_contexts_for_creation(
@@ -295,6 +405,17 @@ def _prepare_kb_contexts_for_creation(
                 knowledge_id = kb_data.get("knowledge_id")
                 kb_name = kb_data.get("name", f"Knowledge Base {knowledge_id}")
                 document_count = kb_data.get("document_count")
+                # Get document_ids if user referenced specific documents
+                document_ids = kb_data.get("document_ids", [])
+
+                # Build type_data
+                type_data_dict = {
+                    "knowledge_id": int(knowledge_id) if knowledge_id else 0,
+                    "document_count": document_count,
+                }
+                # Only add document_ids if provided
+                if document_ids:
+                    type_data_dict["document_ids"] = document_ids
 
                 # Create SubtaskContext object (not yet committed)
                 kb_context = SubtaskContext(
@@ -303,10 +424,7 @@ def _prepare_kb_contexts_for_creation(
                     context_type=ContextType.KNOWLEDGE_BASE.value,
                     name=kb_name,
                     status=ContextStatus.READY.value,
-                    type_data={
-                        "knowledge_id": int(knowledge_id) if knowledge_id else 0,
-                        "document_count": document_count,
-                    },
+                    type_data=type_data_dict,
                 )
                 kb_contexts_to_create.append(kb_context)
             except Exception as e:
@@ -522,8 +640,16 @@ def _prepare_kb_tools_from_contexts(
     """
     Prepare knowledge base tools from context records.
 
-    For group chat tasks, this function also includes knowledge bases
-    bound to the group chat via knowledgeBaseRefs in the task spec.
+    Knowledge base priority rules:
+    1. If subtask has selected knowledge bases (kb_contexts), use ONLY those (strict mode)
+    2. If subtask has no KB selection, fall back to task-level knowledgeBaseRefs (relaxed mode)
+
+    This ensures user's explicit KB selection in a message takes precedence
+    over task-level bound knowledge bases.
+
+    Prompt mode:
+    - Strict mode: User explicitly selected KB for this message, AI must use KB only
+    - Relaxed mode: KB inherited from task, AI can use general knowledge as fallback
 
     Args:
         kb_contexts: List of knowledge base SubtaskContext records
@@ -539,21 +665,30 @@ def _prepare_kb_tools_from_contexts(
     extra_tools: List[BaseTool] = []
     enhanced_system_prompt = base_system_prompt
 
-    # Extract knowledge_id values from user-selected contexts
-    knowledge_base_ids = [
-        c.knowledge_id for c in kb_contexts if c.knowledge_id is not None
-    ]
+    # Priority 1: Subtask-level knowledge bases (user-selected for this message)
+    subtask_kb_ids = [c.knowledge_id for c in kb_contexts if c.knowledge_id is not None]
 
-    # For group chat tasks, also include bound knowledge bases
-    if task_id:
-        bound_kb_ids = _get_bound_knowledge_base_ids(db, task_id)
-        if bound_kb_ids:
+    # Track whether KB is user-selected (strict mode) or inherited from task (relaxed mode)
+    is_user_selected_kb = bool(subtask_kb_ids)
+
+    # Determine which knowledge bases to use based on priority
+    if subtask_kb_ids:
+        # Use subtask-level KBs only (user's explicit selection takes precedence)
+        knowledge_base_ids = subtask_kb_ids
+        logger.info(
+            f"[_prepare_kb_tools_from_contexts] Using {len(knowledge_base_ids)} "
+            f"subtask-level knowledge bases (priority 1, strict mode): {knowledge_base_ids}"
+        )
+    elif task_id:
+        # Priority 2: Fall back to task-level bound knowledge bases
+        knowledge_base_ids = _get_bound_knowledge_base_ids(db, task_id)
+        if knowledge_base_ids:
             logger.info(
-                f"[_prepare_kb_tools_from_contexts] Adding {len(bound_kb_ids)} "
-                f"group chat bound knowledge bases: {bound_kb_ids}"
+                f"[_prepare_kb_tools_from_contexts] Using {len(knowledge_base_ids)} "
+                f"task-level bound knowledge bases (priority 2, relaxed mode): {knowledge_base_ids}"
             )
-            # Merge and deduplicate
-            knowledge_base_ids = list(set(knowledge_base_ids + bound_kb_ids))
+    else:
+        knowledge_base_ids = []
 
     if not knowledge_base_ids:
         # Even without current knowledge bases, check for historical KB meta
@@ -569,7 +704,7 @@ def _prepare_kb_tools_from_contexts(
     )
 
     # Import KnowledgeBaseTool
-    from app.chat_shell.tools.builtin import KnowledgeBaseTool
+    from chat_shell.tools.builtin import KnowledgeBaseTool
 
     # Create KnowledgeBaseTool with the specified knowledge bases
     kb_tool = KnowledgeBaseTool(
@@ -580,27 +715,21 @@ def _prepare_kb_tools_from_contexts(
     )
     extra_tools.append(kb_tool)
 
-    # Enhance system prompt to REQUIRE AI to use the knowledge base tool
-    kb_instruction = """
-
-# IMPORTANT: Knowledge Base Requirement
-
-The user has selected specific knowledge bases for this conversation. You MUST use the `knowledge_base_search` tool to retrieve information from these knowledge bases before answering any questions.
-
-## Required Workflow:
-1. **ALWAYS** call `knowledge_base_search` first with the user's query
-2. Wait for the search results
-3. Base your answer **ONLY** on the retrieved information
-4. If the search returns no results or irrelevant information, clearly state: "I cannot find relevant information in the selected knowledge base to answer this question."
-5. **DO NOT** use your general knowledge or make assumptions beyond what's in the knowledge base
-
-## Critical Rules:
-- You MUST search the knowledge base for EVERY user question
-- You MUST NOT answer without searching first
-- You MUST NOT make up information if the knowledge base doesn't contain it
-- If unsure, search again with different keywords
-
-The user expects answers based on the selected knowledge base content only."""
+    # Choose prompt based on whether KB is user-selected or inherited from task
+    if is_user_selected_kb:
+        # Strict mode: User explicitly selected KB for this message
+        kb_instruction = KB_PROMPT_STRICT
+        logger.info(
+            "[_prepare_kb_tools_from_contexts] Using STRICT mode prompt "
+            "(user explicitly selected KB)"
+        )
+    else:
+        # Relaxed mode: KB inherited from task, AI can use general knowledge as fallback
+        kb_instruction = KB_PROMPT_RELAXED
+        logger.info(
+            "[_prepare_kb_tools_from_contexts] Using RELAXED mode prompt "
+            "(KB inherited from task)"
+        )
 
     enhanced_system_prompt = f"{base_system_prompt}{kb_instruction}"
 
@@ -610,20 +739,15 @@ The user expects answers based on the selected knowledge base content only."""
         if kb_meta_prompt:
             enhanced_system_prompt = f"{enhanced_system_prompt}{kb_meta_prompt}"
 
-    logger.info(
-        "[_prepare_kb_tools_from_contexts] Enhanced system prompt with "
-        "REQUIRED knowledge base usage instructions"
-    )
-
     return extra_tools, enhanced_system_prompt
 
 
 def _get_bound_knowledge_base_ids(db: Session, task_id: int) -> List[int]:
     """
-    Get knowledge base IDs bound to a group chat task.
+    Get knowledge base IDs bound to a task.
 
-    This function checks if the task is a group chat and retrieves
-    the knowledge base IDs from knowledgeBaseRefs in the task spec.
+    This function retrieves the knowledge base IDs from knowledgeBaseRefs
+    in the task spec. It works for both group chat and non-group chat tasks.
 
     Note: The knowledgeBaseRefs stores display names (spec.name), not Kind.name.
     We need to query by spec.name to find the correct knowledge base.
@@ -633,7 +757,7 @@ def _get_bound_knowledge_base_ids(db: Session, task_id: int) -> List[int]:
         task_id: Task ID
 
     Returns:
-        List of knowledge base IDs bound to the group chat
+        List of knowledge base IDs bound to the task
     """
     from app.models.task import TaskResource
 
@@ -656,18 +780,12 @@ def _get_bound_knowledge_base_ids(db: Session, task_id: int) -> List[int]:
 
         task_json = task.json if isinstance(task.json, dict) else {}
         spec = task_json.get("spec", {})
-        is_group_chat = spec.get("is_group_chat", False)
         kb_refs = spec.get("knowledgeBaseRefs", []) or []
 
         logger.info(
             f"[_get_bound_knowledge_base_ids] task_id={task_id}, "
-            f"is_group_chat={is_group_chat}, kb_refs_count={len(kb_refs)}, "
-            f"kb_refs={kb_refs}"
+            f"kb_refs_count={len(kb_refs)}, kb_refs={kb_refs}"
         )
-
-        # Only process for group chat tasks
-        if not is_group_chat:
-            return []
 
         if not kb_refs:
             return []
@@ -744,7 +862,7 @@ def _build_historical_kb_meta_prompt(
     Returns:
         Formatted prompt string with KB meta info, or empty string
     """
-    from app.chat_shell.history.loader import get_knowledge_base_meta_prompt
+    from chat_shell.history.loader import get_knowledge_base_meta_prompt
 
     try:
         return get_knowledge_base_meta_prompt(db, task_id)
@@ -772,6 +890,34 @@ def get_knowledge_base_ids_from_subtask(
     """
     kb_contexts = context_service.get_knowledge_base_contexts_by_subtask(db, subtask_id)
     return [c.knowledge_id for c in kb_contexts if c.knowledge_id is not None]
+
+
+def get_document_ids_from_subtask(
+    db: Session,
+    subtask_id: int,
+) -> List[int]:
+    """
+    Get document IDs from a subtask's knowledge base contexts.
+
+    When a user references specific documents from a knowledge base,
+    the document_ids are stored in the context's type_data field.
+    This function extracts all document IDs from all KB contexts.
+
+    Args:
+        db: Database session
+        subtask_id: Subtask ID
+
+    Returns:
+        List of document_id values from knowledge_base type contexts
+    """
+    kb_contexts = context_service.get_knowledge_base_contexts_by_subtask(db, subtask_id)
+    document_ids = []
+    for c in kb_contexts:
+        if c.type_data and isinstance(c.type_data, dict):
+            doc_ids = c.type_data.get("document_ids", [])
+            if doc_ids:
+                document_ids.extend(doc_ids)
+    return document_ids
 
 
 def get_attachment_context_ids_from_subtask(
